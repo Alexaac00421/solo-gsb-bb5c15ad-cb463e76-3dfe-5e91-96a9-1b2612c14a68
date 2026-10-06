@@ -208,10 +208,17 @@ try:
           and len({r["sticker_code"] for r in legacy_stickers}) == 3)
     lcols = {r["name"] for r in lcon2.execute("PRAGMA table_info(assignments)")}
     check("旧库：迁移补 dispensed_at 列", "dispensed_at" in lcols)
+    check("旧库：迁移补作废列 voided_at/void_reason",
+          "voided_at" in lcols and "void_reason" in lcols)
     lcon2.close()
     s, lset = req("POST", f"/api/tests/{legacy_code}/settle",
                   {"token": legacy_token})
     check("旧库：重复结算仍返回冻结结果", s == 200 and lset["valid_count"] == 1)
+    check("旧库：冻结结果含作废数（无作废为 0）",
+          lset["voided_count"] == 0 and lset["voided_assignments"] == [])
+    st, _ = req("POST", f"/api/tests/{legacy_code}/void",
+                {"token": legacy_token, "code": "LEGACYCODE1", "reason": "r"})
+    check("旧库：已结算实验不能作废 (409)", st == 409)
     # 起点标记只补一次（幂等）
     app_db.init_db()
     s, lt2 = req("GET", f"/api/tests/{legacy_code}/timeline?token={legacy_token}")
@@ -819,8 +826,8 @@ try:
     st, rd = req("GET", f"/api/shares/{share_code}")
     check("凭分享凭证读取 200（无需令牌）", st == 200, str(rd))
     allowed = {"sample_a", "sample_b", "deadline", "settled_at", "valid_count",
-               "correct_count", "abstained_count", "missing_count", "p_value",
-               "distinguishable", "conclusion", "now"}
+               "correct_count", "abstained_count", "missing_count", "voided_count",
+               "p_value", "distinguishable", "conclusion", "now"}
     check("读取载荷字段严格等于白名单", set(rd.keys()) == allowed, str(rd.keys()))
     check("读取结果与冻结结算一致（4/4、p=1/81、可辨）",
           rd["sample_a"] == "K-1" and rd["sample_b"] == "K-2"
@@ -1590,6 +1597,409 @@ try:
           s == 403 and "截止" in dcd["detail"], str(dcd))
 
     pcon.close()
+
+    # --- 2.13 样品异常作废（结算前纠错：凭管理凭证 + 盲评码 + 1～200 字原因） ---
+    s, vt = req("POST", "/api/tests", {
+        "sample_a": "V-1", "sample_b": "V-2",
+        "panelists": ["v1", "v2", "v3", "v4", "v5", "v6"],
+        "deadline": int(time.time() * 1000) + 3600_000, "min_valid": 1})
+    check("作废：创建 6 人测试", s == 200, str(vt))
+    vc, vtk = vt["test_code"], vt["token"]
+    vt_rows = {r["panelist"]: r for r in con.execute(
+        "SELECT * FROM assignments WHERE test_id="
+        "(SELECT id FROM tests WHERE code=?)", (vc,))}
+    # v1 答对、v2 答错、v3 弃权；v4/v5/v6 未交
+    req("POST", f"/api/eval/{vt_rows['v1']['code']}/submit",
+        {"answer": vt_rows["v1"]["odd_pos"]})
+    req("POST", f"/api/eval/{vt_rows['v2']['code']}/submit",
+        {"answer": vt_rows["v2"]["odd_pos"] % 3 + 1})
+    req("POST", f"/api/eval/{vt_rows['v3']['code']}/submit", {"abstain": True})
+    # v6 未交先撤回：已撤回评员不可作废
+    st, _ = req("POST", f"/api/tests/{vc}/adjust",
+                {"token": vtk, "withdraw_codes": [vt_rows["v6"]["code"]]})
+    assert st == 200
+
+    # 校验失败一律拒绝且不留痕
+    st, vb0 = req("POST", f"/api/tests/{vc}/void",
+                  {"token": vtk, "code": vt_rows["v4"]["code"], "reason": "   "})
+    check("作废：空白原因被拒 (422)", st == 422, str(vb0))
+    st, _ = req("POST", f"/api/tests/{vc}/void",
+                {"token": vtk, "code": vt_rows["v4"]["code"], "reason": "异" * 201})
+    check("作废：超 200 字原因被拒 (422)", st == 422)
+    st, _ = req("POST", f"/api/tests/{vc}/void", {"token": vtk, "reason": "r"})
+    check("作废：缺盲评码被拒 (422)", st == 422)
+    st, _ = req("POST", f"/api/tests/{vc}/void",
+                {"token": vtk, "code": "  ", "reason": "r"})
+    check("作废：空白盲评码被拒 (422)", st == 422)
+    st, _ = req("POST", f"/api/tests/{vc}/void",
+                {"token": "wrong", "code": vt_rows["v4"]["code"], "reason": "r"})
+    check("作废：错误令牌 403", st == 403)
+    st, _ = req("POST", "/api/tests/NOPE9999/void",
+                {"token": "x", "code": "y", "reason": "r"})
+    check("作废：不存在测试 404", st == 404)
+    st, _ = req("POST", f"/api/tests/{vc}/void",
+                {"token": vtk, "code": "NOPE-NOPE", "reason": "r"})
+    check("作废：无效盲评码 404", st == 404)
+    st, _ = req("POST", f"/api/tests/{vc}/void",
+                {"token": vtk, "code": bm_rows[0]["code"], "reason": "r"})
+    check("作废：非本场盲评码 404", st == 404)
+    st, vw6 = req("POST", f"/api/tests/{vc}/void",
+                  {"token": vtk, "code": vt_rows["v6"]["code"], "reason": "r"})
+    check("作废：已撤回评员被拒 (409)", st == 409 and "撤回" in vw6["detail"],
+          str(vw6))
+    s, vt_tl0 = req("GET", f"/api/tests/{vc}/timeline?token={vtk}")
+    check("作废：校验失败不留任何 void 事件",
+          sum(1 for e in vt_tl0["events"] if e["type"] == "void") == 0)
+
+    # 作废已答对的 v1（已答也可作废；原因 trim 存储）
+    st, v1r = req("POST", f"/api/tests/{vc}/void",
+                  {"token": vtk, "code": vt_rows["v1"]["code"],
+                   "reason": "  v1 三杯贴标错误  "})
+    check("作废：已答评员作废 200（原因 trim 存储）",
+          st == 200 and v1r["ok"] is True and v1r["reused"] is False
+          and v1r["voided"]["panelist"] == "v1"
+          and v1r["voided"]["reason"] == "v1 三杯贴标错误"
+          and v1r["voided"]["voided_at"] <= int(time.time() * 1000), str(v1r))
+    check("作废：响应进度名单人数不变、作废另列、计数剔除",
+          v1r["progress"]["total"] == 5 and v1r["progress"]["voided"] == 1
+          and v1r["progress"]["submitted"] == 2
+          and v1r["progress"]["abstained"] == 1
+          and v1r["progress"]["valid"] == 1, str(v1r["progress"]))
+
+    # 相同原因（trim 后一致）重试 → 原记录；原因冲突 → 409
+    st, v1r2 = req("POST", f"/api/tests/{vc}/void",
+                   {"token": vtk, "code": vt_rows["v1"]["code"],
+                    "reason": "v1 三杯贴标错误"})
+    check("作废：相同原因重试返回原记录（reused，时间不变）",
+          st == 200 and v1r2["reused"] is True and v1r2["ok"] is False
+          and v1r2["voided"]["voided_at"] == v1r["voided"]["voided_at"],
+          str(v1r2))
+    st, v1c = req("POST", f"/api/tests/{vc}/void",
+                  {"token": vtk, "code": vt_rows["v1"]["code"],
+                   "reason": "另一个原因"})
+    check("作废：同码原因冲突被拒 (409)", st == 409 and "冲突" in v1c["detail"],
+          str(v1c))
+
+    # 旧码立即失效；作废不可恢复或撤回；姓名仍占用（名单人数不变）
+    st, _ = req("GET", f"/api/eval/{vt_rows['v1']['code']}")
+    check("作废：旧码查看 → 404", st == 404)
+    st, _ = req("POST", f"/api/eval/{vt_rows['v1']['code']}/submit", {"answer": 1})
+    check("作废：旧码提交 → 404", st == 404)
+    st, vwd = req("POST", f"/api/tests/{vc}/adjust",
+                  {"token": vtk, "withdraw_codes": [vt_rows["v1"]["code"]]})
+    check("作废：已作废不可撤回 (409)", st == 409 and "作废" in vwd["detail"],
+          str(vwd))
+    st, vdup = req("POST", f"/api/tests/{vc}/adjust",
+                   {"token": vtk, "add_panelists": ["v1"]})
+    check("作废：作废者姓名仍不可重用 (422)", st == 422 and "重用" in vdup["detail"],
+          str(vdup))
+
+    # 已发放也可作废：签发制备凭证 → 发放 v5 → 作废 v5
+    st, vv = req("POST", f"/api/tests/{vc}/prep-voucher", {"token": vtk})
+    check("作废：签发制备凭证 200", st == 200, str(vv))
+    st, vd5 = req("POST", f"/api/prep/{vv['voucher']}/dispense", {"panelist": "v5"})
+    check("作废：v5 整组发放确认 200", st == 200 and vd5["ok"] is True, str(vd5))
+    st, v5r = req("POST", f"/api/tests/{vc}/void",
+                  {"token": vtk, "code": vt_rows["v5"]["code"],
+                   "reason": "v5 样品已发放但核实串杯"})
+    check("作废：已发放评员也可作废", st == 200 and v5r["ok"] is True, str(v5r))
+    s, vpl = req("GET", f"/api/prep/{vv['voucher']}")
+    check("作废：制备清单剔除已作废评员",
+          s == 200 and "v5" not in [p["panelist"] for p in vpl["panelists"]])
+    st, _ = req("POST", f"/api/prep/{vv['voucher']}/dispense", {"panelist": "v5"})
+    check("作废：已作废评员不能再确认发放 (404)", st == 404)
+
+    # 弃权也可作废
+    st, v3r = req("POST", f"/api/tests/{vc}/void",
+                  {"token": vtk, "code": vt_rows["v3"]["code"],
+                   "reason": "v3 弃权但样品异常"})
+    check("作废：已弃权评员也可作废", st == 200 and v3r["ok"] is True)
+
+    # 进度：名单人数不变、作废另列、他人分配不变；不泄露个人答案与杯位映射
+    s, vprog = req("GET", f"/api/tests/{vc}?token={vtk}")
+    check("作废：进度名单人数不变（5）、作废数=3、答卷计数剔除作废者",
+          s == 200 and vprog["progress"]["total"] == 5
+          and vprog["progress"]["voided"] == 3
+          and vprog["progress"]["submitted"] == 1
+          and vprog["progress"]["abstained"] == 0
+          and vprog["progress"]["valid"] == 1, str(vprog["progress"]))
+    check("作废：分发名单保留作废者并带 voided 标记",
+          {c["panelist"]: c["voided"] for c in vprog["codes"]}
+          == {"v1": True, "v2": False, "v3": True, "v4": False, "v5": True},
+          str(vprog["codes"]))
+    check("作废：发放进度保留已作废者的发放记录",
+          {d["panelist"]: d["dispensed"] for d in vprog["delivery"]}.get("v5")
+          is True)
+    vprog_blob = json.dumps(vprog, ensure_ascii=False)
+    check("作废：结算前进度不泄露个人答案、杯位映射与作废原因",
+          "odd_pos" not in vprog_blob and '"answer"' not in vprog_blob
+          and "void_reason" not in vprog_blob)
+    vt_after = {r["panelist"]: (r["odd_pos"], r["odd_sample"])
+                for r in con.execute(
+                    "SELECT panelist, odd_pos, odd_sample FROM assignments "
+                    "WHERE test_id=(SELECT id FROM tests WHERE code=?)", (vc,))}
+    check("作废：他人分配不变",
+          all(vt_after[p] == (vt_rows[p]["odd_pos"], vt_rows[p]["odd_sample"])
+              for p in ("v2", "v4")), str(vt_after))
+
+    # 结算前时间线：void 事件含原因与服务端时间；answer 事件仍盲态
+    s, vtl1 = req("GET", f"/api/tests/{vc}/timeline?token={vtk}")
+    vvoid_evs = [e for e in vtl1["events"] if e["type"] == "void"]
+    check("作废：时间线 3 笔 void 事件（重试与失败不追加）",
+          len(vvoid_evs) == 3, str([e["payload"] for e in vvoid_evs]))
+    check("作废：void 事件含评员/盲评码/原因与服务端时间",
+          all({"panelist", "code", "reason"} <= set(e["payload"]) and e["ts"] > 0
+              for e in vvoid_evs)
+          and {e["payload"]["reason"] for e in vvoid_evs}
+              == {"v1 三杯贴标错误", "v5 样品已发放但核实串杯", "v3 弃权但样品异常"},
+          str([e["payload"] for e in vvoid_evs]))
+    vtl1_blob = json.dumps(vtl1, ensure_ascii=False)
+    check("作废：结算前时间线不泄露选杯与对错",
+          '"odd_pos"' not in vtl1_blob and '"correct"' not in vtl1_blob)
+
+    # 截止后（未结算）仍可作废：直接把截止改到过去，再作废未交的 v4（恰 200 字原因）
+    con.execute("UPDATE tests SET deadline=? WHERE code=?",
+                (int(time.time()) - 10, vc))
+    con.commit()
+    st, v4r = req("POST", f"/api/tests/{vc}/void",
+                  {"token": vtk, "code": vt_rows["v4"]["code"], "reason": "杯" * 200})
+    check("作废：截止后（未结算）仍可作废未交评员（200 字原因允许）",
+          st == 200 and v4r["ok"] is True, str(v4r))
+
+    # 结算：作废者全部剔除，另列作废数；原答案留待审计
+    st, vrep = req("POST", f"/api/tests/{vc}/settle", {"token": vtk})
+    check("作废：结算 200", st == 200, str(vrep))
+    check("作废：结算剔除作废者（有效1/答对0/弃权0/未交0/作废4）",
+          vrep["valid_count"] == 1 and vrep["correct_count"] == 0
+          and vrep["abstained_count"] == 0 and vrep["missing_count"] == 0
+          and vrep["voided_count"] == 4, str(vrep))
+    check("作废：二项检验不计入作废者（n=1,k=0 → p=1.0）",
+          vrep["p_value"] == 1.0, str(vrep["p_value"]))
+    check("作废：结算明细不含作废者，另列 voided_assignments 审计",
+          {a["panelist"] for a in vrep["assignments"]} == {"v2"}
+          and {a["panelist"] for a in vrep["voided_assignments"]}
+              == {"v1", "v3", "v4", "v5"}, str(vrep["voided_assignments"]))
+    vaudit = {a["panelist"]: a for a in vrep["voided_assignments"]}
+    check("作废：审计保留原答案/判定/原因/时间与发放记录",
+          vaudit["v1"]["answer"] == vt_rows["v1"]["odd_pos"]
+          and vaudit["v1"]["correct"] is True
+          and vaudit["v3"]["answer"] == "弃权"
+          and vaudit["v4"]["answer"] is None
+          and vaudit["v5"]["dispensed"] is True
+          and vaudit["v4"]["void_reason"] == "杯" * 200
+          and all(a["void_reason"] and a["voided_at"] for a in vaudit.values()),
+          json.dumps(vaudit, ensure_ascii=False))
+    check("作废：结算保留已作废者的发放记录 dispensed_count=1",
+          vrep["dispensed_count"] == 1, str(vrep["dispensed_count"]))
+
+    # 已结算不能作废；冻结结果不变
+    st, vs409 = req("POST", f"/api/tests/{vc}/void",
+                    {"token": vtk, "code": vt_rows["v2"]["code"], "reason": "晚了"})
+    check("作废：已结算实验不能作废 (409)",
+          st == 409 and "结算" in vs409["detail"], str(vs409))
+    st, vrep2 = req("POST", f"/api/tests/{vc}/settle", {"token": vtk})
+    check("作废：结算后重复结算结果不变",
+          st == 200 and vrep2["valid_count"] == vrep["valid_count"]
+          and vrep2["voided_count"] == 4
+          and vrep2["settled_at"] == vrep["settled_at"])
+
+    # 脱敏分享：剔除作废者并另列作废数
+    st, vsh = req("POST", f"/api/tests/{vc}/shares",
+                  {"token": vtk, "ttl_seconds": 3600, "note": "作废公示"})
+    check("作废：已结算实验可生成分享凭证", st == 200, str(vsh))
+    st, vrd = req("GET", f"/api/shares/{vsh['share_code']}")
+    check("作废：脱敏分享剔除作废者并另列作废数",
+          st == 200 and vrd["valid_count"] == 1 and vrd["correct_count"] == 0
+          and vrd["abstained_count"] == 0 and vrd["missing_count"] == 0
+          and vrd["voided_count"] == 4, str(vrd))
+
+    # 结算后时间线：void 共 4 笔；作废者原答卷事件透出答案供审计
+    s, vtl2 = req("GET", f"/api/tests/{vc}/timeline?token={vtk}")
+    check("作废：结算后时间线 void 事件共 4 笔",
+          sum(1 for e in vtl2["events"] if e["type"] == "void") == 4)
+    v1_ans_evs = [e for e in vtl2["events"]
+                  if e["type"] == "answer"
+                  and e["payload"].get("code") == vt_rows["v1"]["code"]]
+    check("作废：结算后作废者原答卷事件透出答案供审计",
+          len(v1_ans_evs) == 1
+          and v1_ans_evs[0]["payload"].get("correct") is True
+          and v1_ans_evs[0]["payload"].get("odd_pos") == vt_rows["v1"]["odd_pos"],
+          str(v1_ans_evs))
+    vsettle_ev = [e for e in vtl2["events"] if e["type"] == "settle"][0]
+    check("作废：settle 事件含作废数",
+          vsettle_ev["payload"]["voided_count"] == 4, str(vsettle_ev["payload"]))
+
+    # 复测配对：作废答卷不纳入配对（首场仅 v2 在有效名单）
+    s, vt2 = req("POST", "/api/tests", {
+        "sample_a": "V-1", "sample_b": "V-2",
+        "panelists": ["v1", "v2", "v3", "v4", "v5"],
+        "deadline": int(time.time() * 1000) + 3600_000, "min_valid": 1})
+    assert s == 200
+    vt2_rows = {r["panelist"]: r for r in con.execute(
+        "SELECT * FROM assignments WHERE test_id="
+        "(SELECT id FROM tests WHERE code=?)", (vt2["test_code"],))}
+    for r in vt2_rows.values():
+        st, _ = req("POST", f"/api/eval/{r['code']}/submit",
+                    {"answer": r["odd_pos"]})
+        assert st == 200
+    con.execute("UPDATE tests SET deadline=? WHERE code=?",
+                (int(time.time()) - 10, vt2["test_code"]))
+    con.commit()
+    st, _ = req("POST", f"/api/tests/{vt2['test_code']}/settle",
+                {"token": vt2["token"]})
+    assert st == 200
+    st, vcmp = req("POST", "/api/compare", {
+        "first_test_code": vc, "first_token": vtk,
+        "second_test_code": vt2["test_code"], "second_token": vt2["token"]})
+    check("作废：复测配对不纳入作废答卷（仅 v2 配对且有效）",
+          st == 200 and vcmp["paired_count"] == 1
+          and vcmp["paired_valid_count"] == 1
+          and vcmp["only_second_correct"] == 1
+          and vcmp["unpaired_count"] == 4
+          and vcmp["unpaired_second_only"] == 4, str(vcmp))
+
+    # 提前结束后仍可作废
+    s, ve = req("POST", "/api/tests", {
+        "sample_a": "VE-1", "sample_b": "VE-2",
+        "panelists": ["ve1", "ve2"],
+        "deadline": int(time.time() * 1000) + 3600_000, "min_valid": 1})
+    assert s == 200
+    ve_rows = {r["panelist"]: r for r in con.execute(
+        "SELECT * FROM assignments WHERE test_id="
+        "(SELECT id FROM tests WHERE code=?)", (ve["test_code"],))}
+    st, _ = req("POST", f"/api/tests/{ve['test_code']}/end",
+                {"token": ve["token"], "reason": "提前结束"})
+    assert st == 200
+    st, ver = req("POST", f"/api/tests/{ve['test_code']}/void",
+                  {"token": ve["token"], "code": ve_rows["ve1"]["code"],
+                   "reason": "结束后核实样品异常"})
+    check("作废：提前结束后仍可作废", st == 200 and ver["ok"] is True, str(ver))
+    st, verep = req("POST", f"/api/tests/{ve['test_code']}/settle",
+                    {"token": ve["token"]})
+    check("作废：提前结束后结算剔除作废者",
+          st == 200 and verep["voided_count"] == 1
+          and verep["missing_count"] == 1 and verep["valid_count"] == 0,
+          str(verep))
+
+    # 并发：作废与答卷竞争同一评员码，按事务先后判定
+    s, vr = req("POST", "/api/tests", {
+        "sample_a": "VR-1", "sample_b": "VR-2",
+        "panelists": [f"vr{i}" for i in range(20)],
+        "deadline": int(time.time() * 1000) + 3600_000, "min_valid": 1})
+    assert s == 200
+    vr_rows = con.execute(
+        "SELECT code FROM assignments WHERE test_id="
+        "(SELECT id FROM tests WHERE code=?) ORDER BY id",
+        (vr["test_code"],)).fetchall()
+
+    def void_submit_race(c):
+        result = {}
+        barrier = threading.Barrier(2)
+
+        def do_submit():
+            barrier.wait()
+            stt, _ = req("POST", f"/api/eval/{c}/submit", {"answer": 1})
+            result["submit"] = stt
+
+        def do_void():
+            barrier.wait()
+            stt, _ = req("POST", f"/api/tests/{vr['test_code']}/void",
+                         {"token": vr["token"], "code": c, "reason": "并发作废"})
+            result["void"] = stt
+
+        t1 = threading.Thread(target=do_submit)
+        t2 = threading.Thread(target=do_void)
+        t1.start(); t2.start(); t1.join(); t2.join()
+        return result
+
+    vrace_ok = no_5xx3 = True
+    n_ans_then_void = n_void_first = 0
+    for i in range(20):
+        c = vr_rows[i]["code"]
+        r = void_submit_race(c)
+        if r["submit"] >= 500 or r["void"] >= 500:
+            no_5xx3 = False
+        row = con.execute(
+            "SELECT status, answer FROM assignments WHERE code=?", (c,)
+        ).fetchone()
+        # 答卷先完成：submit=200、void=200（已答也可作废），作废且答案留档
+        if r["submit"] == 200 and r["void"] == 200:
+            if not (row["status"] == "voided" and row["answer"] == 1):
+                vrace_ok = False
+            n_ans_then_void += 1
+        # 作废先完成：void=200、submit=404（旧码立即失效），作废且无答案
+        elif r["void"] == 200 and r["submit"] == 404:
+            if not (row["status"] == "voided" and row["answer"] is None):
+                vrace_ok = False
+            n_void_first += 1
+        else:
+            vrace_ok = False  # 不允许其他组合
+    check("并发：作废与答卷按事务先后判定，数据库状态与胜出顺序一致",
+          vrace_ok and n_ans_then_void + n_void_first == 20,
+          f"答卷先完成 {n_ans_then_void} 轮，作废先完成 {n_void_first} 轮")
+    check("并发：作废/答卷竞争无 5xx", no_5xx3)
+    s, vrt = req("GET", f"/api/tests/{vr['test_code']}/timeline?token={vr['token']}")
+    check("并发：每码恰好一笔 void 事件，answer 事件数与答卷先完成数一致",
+          sum(1 for e in vrt["events"] if e["type"] == "void") == 20
+          and sum(1 for e in vrt["events"] if e["type"] == "answer")
+              == n_ans_then_void,
+          str(sum(1 for e in vrt["events"] if e["type"] == "answer")))
+
+    # 并发：作废与结算竞争，已结算结果不变
+    s, vs = req("POST", "/api/tests", {
+        "sample_a": "VS-1", "sample_b": "VS-2",
+        "panelists": ["vs1", "vs2", "vs3"],
+        "deadline": int(time.time() * 1000) + 3600_000, "min_valid": 1})
+    assert s == 200
+    vs_code1 = con.execute(
+        "SELECT code FROM assignments WHERE test_id="
+        "(SELECT id FROM tests WHERE code=?) ORDER BY id LIMIT 1",
+        (vs["test_code"],)).fetchone()["code"]
+    con.execute("UPDATE tests SET deadline=? WHERE code=?",
+                (int(time.time()) - 5, vs["test_code"]))
+    con.commit()
+    vs_result = {}
+    vs_barrier = threading.Barrier(2)
+
+    def do_settle_race():
+        vs_barrier.wait()
+        stt, body = req("POST", f"/api/tests/{vs['test_code']}/settle",
+                        {"token": vs["token"]})
+        vs_result["settle"] = (stt, body)
+
+    def do_void_race():
+        vs_barrier.wait()
+        stt, body = req("POST", f"/api/tests/{vs['test_code']}/void",
+                        {"token": vs["token"], "code": vs_code1,
+                         "reason": "与结算并发"})
+        vs_result["void"] = (stt, body)
+
+    t1 = threading.Thread(target=do_settle_race)
+    t2 = threading.Thread(target=do_void_race)
+    t1.start(); t2.start(); t1.join(); t2.join()
+    sst, sbody = vs_result["settle"]
+    vst, vbody = vs_result["void"]
+    check("并发：作废与结算竞争无 5xx", sst < 500 and vst < 500)
+    if vst == 200:
+        # 作废先完成：结算剔除该码（未交 3 人 → 未交 2 + 作废 1）
+        vs_consistent = (sst == 200 and sbody["voided_count"] == 1
+                         and sbody["missing_count"] == 2)
+    else:
+        # 结算先完成：作废 409，结算不含作废
+        vs_consistent = (vst == 409 and sst == 200
+                         and sbody["voided_count"] == 0
+                         and sbody["missing_count"] == 3)
+    check("并发：作废与结算按事务先后判定、结果一致",
+          vs_consistent,
+          f"settle={sst}(voided={sbody.get('voided_count')}) void={vst}")
+    st, vs_again = req("POST", f"/api/tests/{vs['test_code']}/settle",
+                       {"token": vs["token"]})
+    check("并发：结算冻结后结果不变",
+          st == 200 and vs_again["voided_count"] == sbody["voided_count"]
+          and vs_again["missing_count"] == sbody["missing_count"])
+    st, _ = req("POST", f"/api/tests/{vs['test_code']}/void",
+                {"token": vs["token"], "code": vs_code1, "reason": "结算后再试"})
+    check("并发：结算后（或已作废）再作废均被拒 (409)", st == 409)
 
     # --- 2.8 页面可达性 ---
     for path in ("/", "/admin", "/eval", f"/eval/code/{codes[0]}",

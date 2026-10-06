@@ -3,12 +3,13 @@
 角色：
 - 实验负责人：创建测试、凭管理码 + 令牌查看进度、截止后结算并回看分配与答卷；
   截止前可填写原因提前结束收集，立即冻结名单与答卷入口，结束后即可结算；
-  可凭两场已结算实验的测试码与各自令牌做复测配对对照（只读汇总）。
+  可凭两场已结算实验的测试码与各自令牌做复测配对对照（只读汇总）；
+  核实某评员三杯样品异常时，可凭盲评码 + 原因在结算前将其本次分配作废。
 - 评员：凭盲评码进入，截止前（且未被提前结束）仅可见三杯并提交一次（异样杯位置或弃权）。
 
 安全要点：
 - 评员接口任何时刻只返回“三杯随机展示”需要的信息；提交前不暴露 odd_pos/odd_sample。
-- 截止判定以服务端时间为准；答卷、提前结束、名单调整与结算在同一行锁语义下竞争截止线。
+- 截止判定以服务端时间为准；答卷、提前结束、名单调整、作废与结算在同一行锁语义下竞争截止线。
 - 管理令牌以 sha256 哈希存储，请求使用恒定时间比较。
 """
 
@@ -31,10 +32,12 @@ STATIC_DIR = "static"
 ABSTAIN = -1
 ACTIVE = "active"
 WITHDRAWN = "withdrawn"
+VOIDED = "voided"           # 已作废：留在名单但剔除出一切统计，旧码立即失效
 PREP_ACTIVE = "active"      # 制备凭证有效
 PREP_REVOKED = "revoked"    # 制备凭证已撤销
 MAX_PANELISTS = 500
 MAX_END_REASON_LEN = 200  # 负责人提前结束收集的原因长度：1～200 字
+MAX_VOID_REASON_LEN = 200  # 作废分配的原因长度：1～200 字
 MAX_SHARE_TTL_SECONDS = 7 * 24 * 3600  # 脱敏结果分享凭证最长有效期：7 天
 MAX_SHARE_NOTE_LEN = 200
 
@@ -181,6 +184,15 @@ def assignment_detail(a) -> dict:
     }
 
 
+def voided_detail(a) -> dict:
+    """已作废分配的结算后审计视图：原分配与答卷原样保留，附作废原因与时间。"""
+    d = assignment_detail(a)
+    d["voided"] = True
+    d["voided_at"] = None if a["voided_at"] is None else a["voided_at"] * 1000
+    d["void_reason"] = a["void_reason"]
+    return d
+
+
 def settlement_conclusion(frozen) -> str:
     """结算结论文案（settle 接口与时间线 settle 事件共用，保持一致）。"""
     if frozen["valid_count"] < frozen["min_valid"]:
@@ -228,7 +240,7 @@ def render_event(ev: dict, settled: bool, assign_by_code: dict) -> dict:
 
     盲态规则：settled 之前，answer 事件只呈现“已答 / 弃权”，
     不透露选杯、异样杯及对错；settled 之后才透出对应答案与判定。
-    create / adjust / end / settle / history_start 不含盲态答案，按原样呈现。
+    create / adjust / end / void / settle / history_start 不含盲态答案，按原样呈现。
     """
     payload = json.loads(ev["payload"] or "{}")
     item = {
@@ -282,6 +294,7 @@ def sanitized_result(test, counts: dict, read_ts: int) -> dict:
     """分享凭证读取的唯一允许载荷：仅聚合脱敏结果。
 
     严禁出现评员姓名、盲评码、个人答案或异样杯对应关系（odd_pos/odd_sample）。
+    已作废分配不计入有效/答对/弃权/未交与二项检验，仅以聚合作废数另列。
     """
     return {
         "sample_a": test["sample_a"],
@@ -292,6 +305,7 @@ def sanitized_result(test, counts: dict, read_ts: int) -> dict:
         "correct_count": test["correct_count"],
         "abstained_count": counts["abstained"],
         "missing_count": counts["missing"],
+        "voided_count": counts["voided"],
         "p_value": test["p_value"],
         "distinguishable": bool(test["distinguishable"]),
         "conclusion": settlement_conclusion(test),
@@ -336,6 +350,14 @@ class AdjustRoster(BaseModel):
     add_panelists: List[str] = Field(
         default_factory=list, description="补位评员姓名，同一实验姓名不得重用"
     )
+
+
+class VoidAssignment(BaseModel):
+    """负责人核实三杯样品异常后作废某评员本次分配：凭盲评码 + 1～200 字原因。"""
+    token: str
+    code: str = Field(default="", description="要作废的评员盲评码")
+    reason: str = Field(default="",
+                        description="作废原因（trim 后 1～200 字，记入时间线）")
 
 
 class ShareCreate(BaseModel):
@@ -467,15 +489,19 @@ def create_test(body: TestCreate):
 
 @app.get("/api/tests/{test_code}")
 def get_test(test_code: str, token: str):
-    """负责人进度视图：截止/结算前不包含任何异样杯对应关系与个人答案。"""
+    """负责人进度视图：截止/结算前不包含任何异样杯对应关系与个人答案。
+
+    已作废分配仍留在名单中（名单人数不变，逐条带 voided 标记），
+    但从已交/弃权/有效计数中剔除，仅以聚合作废数另列。
+    """
     row = require_admin(test_code, token)
     conn = db.read_conn()
     try:
         assigns = conn.execute(
-            "SELECT panelist, code, answer, answered_at, dispensed_at "
+            "SELECT panelist, code, answer, answered_at, dispensed_at, status "
             "FROM assignments "
-            "WHERE test_id = ? AND status = ? ORDER BY id",
-            (row["id"], ACTIVE),
+            "WHERE test_id = ? AND status IN (?, ?) ORDER BY id",
+            (row["id"], ACTIVE, VOIDED),
         ).fetchall()
         withdrawn = conn.execute(
             "SELECT COUNT(*) AS c FROM assignments "
@@ -495,9 +521,11 @@ def get_test(test_code: str, token: str):
         conn.close()
 
     ts = now_ts()
-    submitted = sum(1 for a in assigns if a["answer"] is not None)
-    abstained = sum(1 for a in assigns if a["answer"] == ABSTAIN)
-    valid = sum(1 for a in assigns if a["answer"] not in (None, ABSTAIN))
+    live = [a for a in assigns if a["status"] == ACTIVE]  # 未作废：参与答卷计数
+    voided_n = len(assigns) - len(live)
+    submitted = sum(1 for a in live if a["answer"] is not None)
+    abstained = sum(1 for a in live if a["answer"] == ABSTAIN)
+    valid = sum(1 for a in live if a["answer"] not in (None, ABSTAIN))
     dispensed = sum(1 for a in assigns if a["dispensed_at"] is not None)
     preparation_closed = ts >= row["deadline"] or row["ended_at"] is not None
 
@@ -517,6 +545,7 @@ def get_test(test_code: str, token: str):
         "codes": [  # 仅负责人可见，用于向评员分发专属盲评链接
             {"panelist": a["panelist"],
              "code": a["code"],
+             "voided": a["status"] == VOIDED,
              "dispensed": a["dispensed_at"] is not None,
              "url": f"/eval/code/{a['code']}"}
             for a in assigns
@@ -526,6 +555,7 @@ def get_test(test_code: str, token: str):
             "submitted": submitted,
             "abstained": abstained,
             "valid": valid,
+            "voided": voided_n,
         },
         "preparation": {
             "dispensed": dispensed,
@@ -547,6 +577,7 @@ def get_test(test_code: str, token: str):
         "delivery": [
             {
                 "panelist": a["panelist"],
+                "voided": a["status"] == VOIDED,
                 "dispensed": a["dispensed_at"] is not None,
                 "dispensed_at": (
                     None if a["dispensed_at"] is None
@@ -676,6 +707,11 @@ def settle(test_code: str, body: AdminAction):
             )
             abstained = sum(1 for a in assigns if a["answer"] == ABSTAIN)
             missing = sum(1 for a in assigns if a["answer"] is None)
+            voided = conn.execute(
+                "SELECT COUNT(*) AS c FROM assignments "
+                "WHERE test_id = ? AND status = ?",
+                (row["id"], VOIDED),
+            ).fetchone()["c"]
             p = binomial_tail(valid, correct)
             distinguishable = int(valid >= row["min_valid"] and p <= 0.05)
             conn.execute(
@@ -689,6 +725,7 @@ def settle(test_code: str, body: AdminAction):
                 "correct_count": correct,
                 "abstained_count": abstained,
                 "missing_count": missing,
+                "voided_count": voided,
                 "p_value": p,
                 "min_valid": row["min_valid"],
                 "distinguishable": bool(distinguishable),
@@ -705,6 +742,12 @@ def settle(test_code: str, body: AdminAction):
             "ORDER BY id",
             (row["id"], ACTIVE),
         ).fetchall()
+        # 已作废分配：不参与任何计数，原分配与答卷留待结算后审计
+        voided_rows = conn.execute(
+            "SELECT * FROM assignments WHERE test_id = ? AND status = ? "
+            "ORDER BY id",
+            (row["id"], VOIDED),
+        ).fetchall()
 
     return {
         "test_code": frozen["code"],
@@ -719,12 +762,16 @@ def settle(test_code: str, body: AdminAction):
         "correct_count": frozen["correct_count"],
         "abstained_count": sum(1 for a in assigns if a["answer"] == ABSTAIN),
         "missing_count": sum(1 for a in assigns if a["answer"] is None),
-        "dispensed_count": sum(1 for a in assigns if a["dispensed_at"] is not None),
+        "voided_count": len(voided_rows),
+        "dispensed_count": sum(
+            1 for a in assigns + voided_rows if a["dispensed_at"] is not None
+        ),
         "p_value": frozen["p_value"],
         "min_valid": frozen["min_valid"],
         "distinguishable": bool(frozen["distinguishable"]),
         "conclusion": settlement_conclusion(frozen),
         "assignments": [assignment_detail(a) for a in assigns],
+        "voided_assignments": [voided_detail(a) for a in voided_rows],
     }
 
 
@@ -862,6 +909,12 @@ def adjust_roster(test_code: str, body: AdjustRoster):
                 raise HTTPException(
                     status_code=409, detail=f"盲评码 {code} 已撤回，不能重复撤回"
                 )
+            if a["status"] == VOIDED:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"评员「{a['panelist']}」的分配已作废，"
+                           f"作废不可恢复或撤回（盲评码 {code}）",
+                )
             if a["dispensed_at"] is not None:
                 raise HTTPException(
                     status_code=409,
@@ -989,6 +1042,119 @@ def adjust_roster(test_code: str, body: AdjustRoster):
             "submitted": submitted,
             "abstained": abstained,
             "valid": valid_answers,
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# 样品异常作废（结算前，含截止 / 提前结束之后）
+# ---------------------------------------------------------------------------
+
+@app.post("/api/tests/{test_code}/void")
+def void_assignment(test_code: str, body: VoidAssignment):
+    """负责人核实某评员三杯样品异常后，将其本次分配作废。
+
+    - 凭管理凭证 + 盲评码 + 1～200 字原因；结算前均可操作，
+      截止或提前结束后仍可作废；已发放、已答或弃权者也可作废。
+    - 作废不改变名单人数与他人分配：该分配留在名单中（另列作废数），
+      但从进度、结算与脱敏分享的有效/答对/弃权/未交及二项检验中剔除；
+      跨场复测配对同样不纳入作废答卷。
+    - 幂等：同一盲评码以相同原因（trim 后）重试返回原作废记录
+      （reused=true，不重复写时间线）；原因不一致视为冲突（409）。
+    - 非本场盲评码 404；已撤回评员 409；已结算实验 409（结果已冻结）。
+    - 作废不可恢复或撤回：旧码立即无法查看或提交；原答案保留至结算后审计。
+    - 与答卷 / 结算并发时按实际先取得写锁并提交者判定；
+      作废事件（原因与服务端时间）与状态变更在同一写事务提交，失败不留痕。
+    """
+    reason = body.reason.strip()
+    if not reason:
+        raise HTTPException(status_code=422, detail="作废原因不能为空")
+    if len(reason) > MAX_VOID_REASON_LEN:
+        raise HTTPException(status_code=422,
+                            detail=f"作废原因长度不得超过 {MAX_VOID_REASON_LEN} 字")
+    code = body.code.strip()
+    if not code:
+        raise HTTPException(status_code=422, detail="盲评码不能为空")
+
+    with db.write_tx() as conn:
+        row = conn.execute(
+            "SELECT * FROM tests WHERE code = ?", (test_code,)
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="测试不存在")
+        verify_admin(row, body.token)
+
+        if row["settled_at"] is not None:
+            raise HTTPException(status_code=409,
+                                detail="测试已结算，结果已冻结，不能作废分配")
+
+        a = conn.execute(
+            "SELECT * FROM assignments WHERE test_id = ? AND code = ?",
+            (row["id"], code),
+        ).fetchone()
+        if a is None:
+            raise HTTPException(status_code=404,
+                                detail=f"盲评码无效或不属于本场实验：{code}")
+        if a["status"] == WITHDRAWN:
+            raise HTTPException(
+                status_code=409,
+                detail=f"评员「{a['panelist']}」已撤回，不能作废（盲评码 {code}）",
+            )
+
+        reused = False
+        if a["status"] == VOIDED:
+            if (a["void_reason"] or "") != reason:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"盲评码 {code} 已按其他原因作废，原因冲突；"
+                           "作废不可恢复或撤回",
+                )
+            # 幂等：相同原因重试返回原作废记录
+            voided_at = a["voided_at"]
+            reused = True
+        else:
+            ts = now_ts()
+            conn.execute(
+                "UPDATE assignments SET status=?, voided_at=?, void_reason=? "
+                "WHERE id=?",
+                (VOIDED, ts, reason, a["id"]),
+            )
+            # 作废事件与状态变更同一事务；原因与服务端时间进入时间线
+            db.log_event(conn, row["id"], ts, "void", {
+                "panelist": a["panelist"],
+                "code": a["code"],
+                "reason": reason,
+            })
+            voided_at = ts
+
+        live_rows = conn.execute(
+            "SELECT answer FROM assignments WHERE test_id = ? AND status = ?",
+            (row["id"], ACTIVE),
+        ).fetchall()
+        voided_count = conn.execute(
+            "SELECT COUNT(*) AS c FROM assignments "
+            "WHERE test_id = ? AND status = ?",
+            (row["id"], VOIDED),
+        ).fetchone()["c"]
+
+    return {
+        "ok": not reused,
+        "reused": reused,
+        "test_code": row["code"],
+        "voided": {
+            "panelist": a["panelist"],
+            "code": a["code"],
+            "reason": reason,
+            "voided_at": voided_at * 1000,
+        },
+        "progress": {
+            "total": len(live_rows) + voided_count,
+            "submitted": sum(1 for r in live_rows if r["answer"] is not None),
+            "abstained": sum(1 for r in live_rows if r["answer"] == ABSTAIN),
+            "valid": sum(
+                1 for r in live_rows if r["answer"] not in (None, ABSTAIN)
+            ),
+            "voided": voided_count,
         },
     }
 
@@ -1196,12 +1362,18 @@ def read_share(share_code: str):
             "FROM assignments WHERE test_id = ? AND status = ?",
             (ABSTAIN, test["id"], ACTIVE),
         ).fetchone()
+        voided = conn.execute(
+            "SELECT COUNT(*) AS c FROM assignments "
+            "WHERE test_id = ? AND status = ?",
+            (test["id"], VOIDED),
+        ).fetchone()["c"]
     finally:
         conn.close()
 
     return sanitized_result(test, {
         "abstained": agg["abstained"] or 0,
         "missing": agg["missing"] or 0,
+        "voided": voided,
     }, now)
 
 

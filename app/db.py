@@ -36,7 +36,7 @@ CREATE TABLE IF NOT EXISTS events (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,   -- 全局提交顺序（稳定排序键）
     test_id     INTEGER NOT NULL REFERENCES tests(id),
     ts          INTEGER NOT NULL,                    -- 服务端事件时间（秒，事务内采集）
-    type        TEXT NOT NULL,   -- create/answer/adjust/end/settle/history_start/share_create/share_revoke/prep_voucher_issue/prep_voucher_revoke/dispense
+    type        TEXT NOT NULL,   -- create/answer/adjust/end/settle/history_start/share_create/share_revoke/prep_voucher_issue/prep_voucher_revoke/dispense/void
     payload     TEXT NOT NULL DEFAULT '{}'           -- JSON，盲态字段读取时再裁剪
 );
 
@@ -51,7 +51,9 @@ CREATE TABLE IF NOT EXISTS assignments (
     odd_sample   TEXT NOT NULL,                       -- 异样杯样本编号（A 或 B）
     answer       INTEGER,                             -- 1/2/3；弃权为 -1；未提交 NULL
     answered_at  INTEGER,
-    status       TEXT NOT NULL DEFAULT 'active',      -- active 有效名单；withdrawn 已撤回
+    status       TEXT NOT NULL DEFAULT 'active',      -- active 有效名单；withdrawn 已撤回；voided 已作废
+    voided_at    INTEGER,                             -- 作废时间（秒）；NULL 表示未作废
+    void_reason  TEXT,                                -- 作废原因（trim 后 1～200 字）
     UNIQUE(test_id, panelist)
 );
 
@@ -126,6 +128,11 @@ def init_db():
             conn.execute(
                 "ALTER TABLE assignments ADD COLUMN dispensed_at INTEGER"
             )
+        # 兼容旧库：为已存在的 assignments 表补作废时间 / 原因列
+        if "voided_at" not in cols:
+            conn.execute("ALTER TABLE assignments ADD COLUMN voided_at INTEGER")
+        if "void_reason" not in cols:
+            conn.execute("ALTER TABLE assignments ADD COLUMN void_reason TEXT")
         # 兼容旧库：为已存在的 tests 表补提前结束相关列
         tcols = {r["name"] for r in conn.execute("PRAGMA table_info(tests)")}
         if "ended_at" not in tcols:
