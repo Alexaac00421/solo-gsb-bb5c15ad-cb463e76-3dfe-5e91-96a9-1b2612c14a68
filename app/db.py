@@ -28,6 +28,9 @@ CREATE TABLE IF NOT EXISTS tests (
     end_reason         TEXT,                             -- 提前结束原因（trim 后 1～200 字）
     valid_count        INTEGER,
     correct_count      INTEGER,
+    abstained_count    INTEGER,                          -- 结算冻结时的弃权数（作废者剔除后）
+    missing_count      INTEGER,                          -- 结算冻结时的未交数（作废者剔除后）
+    voided_count       INTEGER,                          -- 结算冻结时的作废数（另列，不参与检验）
     p_value            REAL,
     distinguishable    INTEGER
 );
@@ -36,7 +39,7 @@ CREATE TABLE IF NOT EXISTS events (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,   -- 全局提交顺序（稳定排序键）
     test_id     INTEGER NOT NULL REFERENCES tests(id),
     ts          INTEGER NOT NULL,                    -- 服务端事件时间（秒，事务内采集）
-    type        TEXT NOT NULL,   -- create/answer/adjust/end/settle/history_start/share_create/share_revoke/prep_voucher_issue/prep_voucher_revoke/dispense
+    type        TEXT NOT NULL,   -- create/answer/adjust/end/settle/void/history_start/share_create/share_revoke/prep_voucher_issue/prep_voucher_revoke/dispense
     payload     TEXT NOT NULL DEFAULT '{}'           -- JSON，盲态字段读取时再裁剪
 );
 
@@ -51,7 +54,9 @@ CREATE TABLE IF NOT EXISTS assignments (
     odd_sample   TEXT NOT NULL,                       -- 异样杯样本编号（A 或 B）
     answer       INTEGER,                             -- 1/2/3；弃权为 -1；未提交 NULL
     answered_at  INTEGER,
-    status       TEXT NOT NULL DEFAULT 'active',      -- active 有效名单；withdrawn 已撤回
+    status       TEXT NOT NULL DEFAULT 'active',      -- active 有效名单；withdrawn 已撤回；voided 已作废
+    voided_at    INTEGER,                             -- 负责人作废时间（秒）；NULL 表示未作废
+    void_reason  TEXT,                                -- 作废原因（trim 后 1～200 字）
     UNIQUE(test_id, panelist)
 );
 
@@ -132,6 +137,18 @@ def init_db():
             conn.execute("ALTER TABLE tests ADD COLUMN ended_at INTEGER")
         if "end_reason" not in tcols:
             conn.execute("ALTER TABLE tests ADD COLUMN end_reason TEXT")
+        # 兼容旧库：结算冻结统计列（作废功能上线前的已结算测试按当前名单回填）
+        if "abstained_count" not in tcols:
+            conn.execute("ALTER TABLE tests ADD COLUMN abstained_count INTEGER")
+        if "missing_count" not in tcols:
+            conn.execute("ALTER TABLE tests ADD COLUMN missing_count INTEGER")
+        if "voided_count" not in tcols:
+            conn.execute("ALTER TABLE tests ADD COLUMN voided_count INTEGER")
+        # 兼容旧库：为已存在的 assignments 表补作废相关列
+        if "voided_at" not in cols:
+            conn.execute("ALTER TABLE assignments ADD COLUMN voided_at INTEGER")
+        if "void_reason" not in cols:
+            conn.execute("ALTER TABLE assignments ADD COLUMN void_reason TEXT")
         conn.commit()
     finally:
         conn.close()

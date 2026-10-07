@@ -67,13 +67,14 @@ function render(t) {
         结束原因：${esc(t.end_reason)}
       </div>` : ''}
       <div class="stat-grid">
-        <div class="stat"><div class="num">${t.progress.total}</div><div class="cap">评员总数</div></div>
+        <div class="stat"><div class="num">${t.progress.total}</div><div class="cap">评员总数（含作废）</div></div>
         <div class="stat"><div class="num">${t.progress.submitted}</div><div class="cap">已提交(含弃权)</div></div>
         <div class="stat"><div class="num">${t.progress.valid}</div><div class="cap">有效答卷</div></div>
         <div class="stat"><div class="num">${t.preparation ? t.preparation.dispensed : 0}</div><div class="cap">已发放实体样品</div></div>
         <div class="stat"><div class="num">${t.withdrawn_count || 0}</div><div class="cap">已撤回</div></div>
+        <div class="stat"><div class="num">${t.voided_count || 0}</div><div class="cap">已作废</div></div>
       </div>
-      <p class="hint">截止前仅显示汇总计数，不显示任何评员的答案与三杯对应关系，以防泄露。</p>
+      <p class="hint">截止前仅显示汇总计数，不显示任何评员的答案与三杯对应关系，以防泄露。作废者不计入有效、答对、弃权或未交，另列作废数，但不改变名单人数。</p>
       <button id="settleBtn" ${((!past && !t.ended) || t.settled) ? 'disabled' : ''}>
         ${t.settled ? '已结算（结果已冻结）'
           : (past || t.ended) ? '立即结算' : '到期或结束收集后才能结算'}
@@ -96,6 +97,8 @@ function render(t) {
       </p>
       ${renderPrep(t)}
     </div>
+
+    ${renderVoidCard(t)}
 
     ${(!t.ended && !t.settled && !past) ? `
     <div class="card">
@@ -204,6 +207,12 @@ function render(t) {
   }, 1000);
 
   document.getElementById('settleBtn').addEventListener('click', doSettle);
+  const voidBtn = document.getElementById('voidBtn');
+  if (voidBtn) voidBtn.addEventListener('click', doVoid);
+  const voidSelect = document.getElementById('voidPanelist');
+  if (voidSelect) voidSelect.addEventListener('change', () => {
+    document.getElementById('voidCode').value = voidSelect.value || '';
+  });
   const adjustBtn = document.getElementById('adjustBtn');
   if (adjustBtn) adjustBtn.addEventListener('click', doAdjust);
   const endBtn = document.getElementById('endBtn');
@@ -213,6 +222,87 @@ function render(t) {
   const prepIssueBtn = document.getElementById('prepIssueBtn');
   if (prepIssueBtn) prepIssueBtn.addEventListener('click', issuePrep);
   if (t.settled) doSettle();
+}
+
+function renderVoidCard(t) {
+  const voided = t.voided || [];
+  return `
+    <div class="card">
+      <h2>作废异常评员本次分配（结算前 / 截止 / 结束后均可）</h2>
+      <p class="hint">
+        核实某评员三杯样品异常后，可凭其<b>盲评码</b>与 <b>1～200 字原因</b>
+        将其<b>本次分配作废</b>：<b>已发放、已答或弃权也可作废</b>，
+        不改变名单人数与他人分配，也不补位。作废<b>不可恢复或撤回</b>，
+        旧盲评码立即失效（评员页 404，不能再提交）；原答案保留至结算后审计。
+        作废者从有效、答对、弃权、未交及二项检验中<b>剔除并另列作废数</b>，
+        跨场复测配对也不纳入。<b>已结算结果不因结算后的作废改变。</b>
+        相同原因重试会返回原作废记录。
+      </p>
+      <label>选择评员（自动带出盲评码），或直接粘贴盲评码</label>
+      <div class="row">
+        <div style="flex:1">
+          <select id="voidPanelist">
+            <option value="">— 当前有效评员 —</option>
+            ${(t.codes || []).map(c =>
+              `<option value="${esc(c.code)}">${esc(c.panelist)}${c.dispensed ? '（已发放）' : ''}</option>`).join('')}
+          </select>
+        </div>
+        <div style="flex:1">
+          <input type="text" id="voidCode" placeholder="盲评码（也可直接粘贴）"
+                 autocomplete="off">
+        </div>
+      </div>
+      <label>作废原因（必填，1～200 字，将写入负责人操作时间线）</label>
+      <textarea id="voidReason" rows="2" maxlength="200"
+        placeholder="例如：现场核实 3 号杯倾倒、样品受污染，该评员三杯样品异常"></textarea>
+      <button id="voidBtn" class="danger">作废该评员本次分配</button>
+      <div id="voidMsg"></div>
+      ${voided.length ? `
+      <p class="hint" style="margin-top:16px">作废清单（${voided.length} 人；结算前不显示个人答案与杯位）：</p>
+      <table>
+        <thead><tr><th>评员</th><th>盲评码</th><th>作废时间</th><th>作废原因</th><th>实体样品</th></tr></thead>
+        <tbody>
+          ${voided.map(v => `
+            <tr>
+              <td>${esc(v.panelist)}</td>
+              <td class="code">${esc(v.code)}</td>
+              <td>${fmtTime(v.voided_at)}</td>
+              <td>${esc(v.void_reason)}</td>
+              <td>${v.dispensed ? '<span class="badge wait">作废前已发放</span>'
+                : '<span class="badge ok">未发放</span>'}</td>
+            </tr>`).join('')}
+        </tbody>
+      </table>` : '<p class="hint">暂无作废记录。</p>'}
+    </div>`;
+}
+
+async function doVoid() {
+  const msgEl = document.getElementById('voidMsg');
+  const vCode = document.getElementById('voidCode').value.trim();
+  const vReason = document.getElementById('voidReason').value.trim();
+  if (!vCode) { showErr(msgEl, '请选择评员或填写要作废的盲评码。'); return; }
+  if (!vReason) { showErr(msgEl, '请填写作废原因（1～200 字）。'); return; }
+  if (vReason.length > 200) { showErr(msgEl, '作废原因不得超过 200 字。'); return; }
+  if (!confirm('确认作废该评员的本次分配？\n\n'
+      + '此操作不可恢复或撤回：旧盲评码立即失效，其答卷将从有效/答对/弃权/未交'
+      + '及二项检验中剔除（另列作废数），名单人数与他人分配不变。')) return;
+
+  const btn = document.getElementById('voidBtn');
+  btn.disabled = true; btn.textContent = '作废中…';
+  try {
+    const r = await api(`/api/tests/${encodeURIComponent(code)}/void`, {
+      method: 'POST', body: { token, code: vCode, reason: vReason },
+    });
+    const stateMap = { answered: '此前已作答', abstained: '此前已弃权', missing: '此前未交' };
+    showInfo(msgEl,
+      (r.reused ? '该评员已按相同原因作废（返回原作废记录）：' : '已作废：')
+      + `${r.panelist}（${stateMap[r.prior_state] || r.prior_state}），作废时间 ${fmtTime(r.voided_at)}。`
+      + '旧盲评码已失效；作废数已从有效统计中剔除。', 'no');
+    load();
+  } catch (err) {
+    showErr(msgEl, err.message);
+    btn.disabled = false; btn.textContent = '作废该评员本次分配';
+  }
 }
 
 function renderPrep(t) {
@@ -443,11 +533,34 @@ function renderReport(r) {
       <div class="stat"><div class="num">${r.correct_count}</div><div class="cap">答对</div></div>
       <div class="stat"><div class="num">${r.abstained_count}</div><div class="cap">弃权</div></div>
       <div class="stat"><div class="num">${r.missing_count}</div><div class="cap">未交</div></div>
+      <div class="stat"><div class="num">${r.voided_count || 0}</div><div class="cap">作废（不计入）</div></div>
       <div class="stat"><div class="num">${r.p_value === null ? '—' : r.p_value.toFixed(4)}</div>
         <div class="cap">单侧尾概率 (p=1/3)</div></div>
     </div>
     <p class="hint">判定规则：有效答卷 ≥ ${r.min_valid} 且
-      P(X≥答对 | X~Binomial(n,1/3)) ≤ 0.05 才判为可辨。</p>
+      P(X≥答对 | X~Binomial(n,1/3)) ≤ 0.05 才判为可辨。作废答卷不参与统计；本结果已冻结，结算后的作废不改变以上数字。</p>
+    ${(r.voided && r.voided.length) ? `
+    <h2>作废答卷审计（${r.voided.length} 份，不参与统计）</h2>
+    <table>
+      <thead><tr>
+        <th>评员</th><th>盲评码</th><th>异样杯位置</th><th>异样杯样本</th>
+        <th>原答案</th><th>作废时间</th><th>作废原因</th>
+      </tr></thead>
+      <tbody>
+        ${r.voided.map(a => `
+          <tr>
+            <td>${esc(a.panelist)}</td>
+            <td class="code">${esc(a.code)}</td>
+            <td>${a.odd_pos} 号杯</td>
+            <td>样本 ${esc(a.odd_sample)}</td>
+            <td>${a.answer === null ? '<span class="badge wait">未交</span>'
+                : a.answer === '弃权' ? '<span class="badge wait">弃权</span>'
+                : `${a.answer} 号杯`}</td>
+            <td>${fmtTime(a.voided_at)}</td>
+            <td>${esc(a.void_reason)}</td>
+          </tr>`).join('')}
+      </tbody>
+    </table>` : ''}
 
     <h2>分配与答卷回看（冻结）</h2>
     <table>
